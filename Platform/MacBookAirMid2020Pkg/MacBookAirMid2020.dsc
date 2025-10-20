@@ -30,7 +30,7 @@
   SKUID_IDENTIFIER               = DEFAULT
   FLASH_DEFINITION               = MacBookAirMid2020Pkg/MacBookAirMid2020.fdf
   SECURE_BOOT_ENABLE             = FALSE
-  AIC_BUILD                      = TRUE #AIC build enabled by default, change to false if you want to use a vGIC
+  AIC_BUILD                      = FALSE #AIC build enabled by default, change to false if you want to use a vGIC
   USES_MAC_CPU                   = TRUE # a futureproofing switch, changes SoC identifier in SMBIOS
   NETWORK_TLS_ENABLE             = TRUE
 
@@ -42,12 +42,14 @@
   gAppleSiliconPkgTokenSpaceGuid.PcdSmbiosSystemModel|"MacBook Air (Mid 2020)"
   gAppleSiliconPkgTokenSpaceGuid.PcdSmbiosSystemModelNumber|"MacBookAir10,1"
   gAppleSiliconPkgTokenSpaceGuid.PcdSmbiosSystemSku|"MacBook Air (MacBookAir10,1)"
-  
+  gAppleSiliconPkgTokenSpaceGuid.PcdAppleNumDwc3Controllers|2 # M1 Max case is hardcoded for now.
+  gAppleSiliconPkgTokenSpaceGuid.PcdAppleNumDwc3Darts|4 # M1 Max case is hardcoded for now.
 
 [Components.common]
 
   MacBookAirMid2020Pkg/AcpiTables/DeviceAcpiTables.inf
 
+!include MacBookAirFamilyPkg/MacBookAirFamily.dsc.inc
 !include T810XFamilyPkg/T810XFamilyPkg.dsc.inc
 !include AppleSiliconPkg/AppleSiliconPkg.dsc.inc
 !include AppleSiliconPkg/FrontpageDsc.inc

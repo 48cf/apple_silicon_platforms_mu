@@ -102,6 +102,72 @@
             },
         })
 
+        /*
+        Device (XHC0) {
+            Name (_HID, "PNP0D15")
+            Name (_UID, One)
+            Name (_CCA, One)
+
+            Method (_CRS, 0, Serialized) {
+                Name (RBUF, ResourceTemplate () {
+                    QWordMemory (
+                        ResourceConsumer,     // ResourceUsage
+                        PosDecode,            // Decode
+                        MinFixed,             // IsMinFixed
+                        MaxFixed,             // IsMaxFixed
+                        NonCacheable,         // Cacheable
+                        ReadWrite,            // ReadAndWrite
+                        0,                    // AddressGranularity - GRA
+                        0x382280000,          // AddressMinimum - MIN
+                        0x38237FFFF,          // AddressMaximum - MAX
+                        0,                    // AddressTranslation - TRA
+                        0x100000              // RangeLength - LEN
+                        )
+                    Interrupt (ResourceConsumer, Level, ActiveHigh, Exclusive) {
+                        777
+                    }
+                })
+                Return (RBUF)
+            }
+
+            Method (_STA) {
+                Return (0xF)
+            }
+        }
+        */
+
+        Device (XHC1) {
+            Name (_HID, "PNP0D15")
+            Name (_UID, One)
+            Name (_CCA, One)
+
+            Method (_CRS, 0, Serialized) {
+                Name (RBUF, ResourceTemplate () {
+                    QWordMemory (
+                        ResourceConsumer,     // ResourceUsage
+                        PosDecode,            // Decode
+                        MinFixed,             // IsMinFixed
+                        MaxFixed,             // IsMaxFixed
+                        NonCacheable,         // Cacheable
+                        ReadWrite,            // ReadAndWrite
+                        0,                    // AddressGranularity - GRA
+                        0x502280000,          // AddressMinimum - MIN
+                        0x50237FFFF,          // AddressMaximum - MAX
+                        0,                    // AddressTranslation - TRA
+                        0x100000              // RangeLength - LEN
+                        )
+                    Interrupt (ResourceConsumer, Level, ActiveHigh, Exclusive) {
+                        857
+                    }
+                })
+                Return (RBUF)
+            }
+
+            Method (_STA) {
+                Return (0xF)
+            }
+        }
+
         Device(COM0) {
             Name(_HID, "APPL8900") // naming it APPL8900 since the Samsung based UART was used since the 8900
             Name(_UID, Zero)
@@ -114,8 +180,10 @@
                 NonCacheable,         // Cacheable
                 ReadWrite,            // ReadAndWrite
                 0x0000000000000000,   // AddressGranularity - GRA
-                FixedPcdGet64(PcdAppleUartBase),   // AddressMinimum - MIN
-                (FixedPcdGet64(PcdAppleUartBase) + 0xFFF),   // AddressMaximum - MAX
+                // FixedPcdGet64(PcdAppleUartBase),   // AddressMinimum - MIN
+                // (FixedPcdGet64(PcdAppleUartBase) + 0xFFFF),   // AddressMaximum - MAX
+                0x235200000,   // AddressMinimum - MIN
+                0x235200fff,   // AddressMaximum - MAX
                 0x0000000000000000,   // AddressTranslation - TRA
                 0x0000000000001000    // RangeLength - LEN
                 )
