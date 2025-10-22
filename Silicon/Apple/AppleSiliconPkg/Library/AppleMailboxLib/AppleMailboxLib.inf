@@ -1,0 +1,36 @@
+#
+#  Copyright (c) 2025, AppleWOA authors. All rights reserved.
+#
+#  Module Name:
+#    AppleMailboxLib.inf
+#  
+#  Abstract:
+#     Simple library to interface with the Apple Mailbox hardware.
+#
+#  Environment:
+#     UEFI DXE (Driver Execution Environment) and runtime services.
+#
+#  License:
+#    SPDX-License-Identifier: MIT
+#
+
+[Defines]
+  INF_VERSION                    = 0x0001001c
+  BASE_NAME                      = AppleMailboxLib
+  FILE_GUID                      = a442c7ab-81fa-4c8c-afdd-7fae15b15fb1
+  MODULE_TYPE                    = BASE
+  VERSION_STRING                 = 1.0
+  LIBRARY_CLASS                  = AppleMailboxLib
+
+[Sources]
+  AppleMailboxLib.c
+
+[Packages]
+  ArmPkg/ArmPkg.dec
+  MdeModulePkg/MdeModulePkg.dec
+  MdePkg/MdePkg.dec
+  AppleSiliconPkg/AppleSiliconPkg.dec
+
+[LibraryClasses]
+  IoLib
+  CompilerIntrinsicsLib

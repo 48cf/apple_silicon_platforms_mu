@@ -237,6 +237,8 @@
   # Apple Device Tree (ADT) access library
   AppleDTLib|AppleSiliconPkg/Library/AppleDTLib/AppleDTLib.inf
 
+  # Apple Mailbox interface library
+  AppleMailboxLib|AppleSiliconPkg/Library/AppleMailboxLib/AppleMailboxLib.inf
 
   # USB Libraries
   UefiUsbLib|MdePkg/Library/UefiUsbLib/UefiUsbLib.inf
