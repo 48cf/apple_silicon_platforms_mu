@@ -1,61 +1,57 @@
 /**
  * Copyright (c) 2023, amarioguy (AppleWOA authors).
- * 
+ *
  * Module Name:
  *     AppleSARTLib.c
- * 
+ *
  * Abstract:
  *     SART driver for Apple silicon platforms from Skye (A11) SoCs onwards.
  *     Required to bring up NVMe and permit DMA. Based off of the m1n1 and Linux driver.
  *     Currently the driver only supports Sicily (A14)/Tonga (M1) SoCs and newer.
- * 
+ *
  * Environment:
  *     UEFI DXE (Driver Execution Environment) and runtime services.
- * 
+ *
  * License:
  *     SPDX-License-Identifier: BSD-2-Clause-Patent OR MIT OR GPL-2.0-only.
- * 
+ *
  *     Original m1n1/Linux driver copyright (c) The Asahi Linux Contributors.
- * 
+ *
 */
 
-#include <PiDxe.h>
-#include <ConvenienceMacros.h>
-#include <Base.h>
-#include <Library/ArmLib.h>
+#include <Library/AppleSARTLib.h>
+#include <Library/ConvenienceMacros.h>
 #include <Library/DebugLib.h>
 #include <Library/IoLib.h>
 #include <Library/MemoryAllocationLib.h>
-#include <Library/AppleAicLib.h>
-#include <Library/AppleDTLib.h>
+
+typedef VOID (*APPLE_SART_GET_ENTRY)(
+    IN APPLE_SART *Sart,
+    IN UINTN Index,
+    OUT APPLE_SART_ENTRY *Entry
+);
+
+typedef BOOLEAN (*APPLE_SART_SET_ENTRY)(
+    IN APPLE_SART *Sart,
+    IN UINTN Index,
+    IN APPLE_SART_ENTRY *Entry
+);
+
+struct _APPLE_SART {
+    UINT64 BaseAddress;
+    UINT32 ProtectedEntries;
+
+    APPLE_SART_GET_ENTRY GetEntry;
+    APPLE_SART_SET_ENTRY SetEntry;
+};
 
 #define APPLE_SART_MAX_ENTRIES 16
-#define SART_ALLOW_ALL_FLAG 0xff
 
-typedef struct SART_DEVICE_STRUCT {
-    //
-    // base address of the SART.
-    //
-    UINTN SARTBaseAddress;
-    UINT32 SARTProtectedEntries;
-} SART_DEVICE;
-
-//
-// TODO: SARTv1 defs (for Skye/A11 support)
-//
-
-
-//
-// Definitions that apply to either SART v2 or v3.
-//
-
+// Definitions that apply to both SART v2 or v3.
 #define APPLE_SART_V2_V3_CONFIG(index) (0x0 + 4 * (index))
 #define APPLE_SART_V2_V3_SIZE_SHIFT 12
 
-//
 // SART v2 specific definitions.
-//
-
 #define APPLE_SART_V2_CONFIG_FLAGS GENMASK(31, 24)
 #define APPLE_SART_V2_PHYS_ADDR(index) (0x40 + 4 * (index))
 #define APPLE_SART_V2_PHYS_ADDR_SHIFT APPLE_SART_V2_V3_SIZE_SHIFT
@@ -63,218 +59,263 @@ typedef struct SART_DEVICE_STRUCT {
 #define APPLE_SART_V2_CONFIG_SIZE GENMASK(23, 0)
 #define APPLE_SART_V2_CONFIG_SIZE_MAX APPLE_SART_V2_CONFIG_SIZE
 
-//
 // SART v3 specific definitions.
-//
-
 #define APPLE_SART_V3_PHYS_ADDR(index) (0x40 + 4 * (index))
 #define APPLE_SART_V3_PHYS_ADDR_SHIFT APPLE_SART_V2_V3_SIZE_SHIFT
 #define APPLE_SART_V3_MAX_SIZE GENMASK(29, 0)
 #define APPLE_SART_V3_SIZE(index) (0x80 + 4 * (index))
 
-//
-//  Description:
-//    Gets a SARTv2 entry, and it's protection/DMA allowed status.
-//
-//  Return value:
-//    None.
-//
-//  Notes:
-//    Should only be called from the public AppleSARTGetEntry function.
-//
-STATIC VOID AppleSARTV2GetEntry(SART_DEVICE *SartDev, UINT32 Index, UINT8 *Flags, VOID **PhysAddr, size_t *Size) {
-    UINT32 Config = MmioRead32(((SartDev->SARTBaseAddress) + APPLE_SART_V2_V3_CONFIG(Index)));
-    *Flags = FIELD_GET(APPLE_SART_V2_CONFIG_FLAGS, Config);
-    *Size = (size_t)((FIELD_GET(APPLE_SART_V2_CONFIG_SIZE, Config)) << APPLE_SART_V2_CONFIG_SIZE_SHIFT);
-    *PhysAddr = (VOID *)((UINT64)(MmioRead32(((SartDev->SARTBaseAddress) + APPLE_SART_V2_PHYS_ADDR(Index))) << APPLE_SART_V2_PHYS_ADDR_SHIFT));
-    DEBUG((DEBUG_INFO, "%a: SART entry %d has flags 0x%x, physical address 0x%p, size 0x%lx\n", __FUNCTION__, *Flags, *PhysAddr, *Size));
-}
-
-//
-//  Description:
-//    Sets a SARTv3 entry, and it's protection/DMA allowed status.
-//
-//  Return value:
-//    TRUE if successful, FALSE otherwise.
-//
-//  Notes:
-//    Should only be called from the public AppleSARTSetEntry function.
-//
-STATIC BOOLEAN AppleSARTV2SetEntry(SART_DEVICE *SartDev, UINT32 Index, UINT8 Flags, VOID *PhysAddr, size_t Size) {
+STATIC
+VOID
+SARTV2GetEntry(
+    IN APPLE_SART *Sart,
+    IN UINTN Index,
+    OUT APPLE_SART_ENTRY *Entry
+) {
     UINT32 Config;
-    UINT64 PhysicalAddress = (UINT64)PhysAddr;
+    UINT32 Address;
 
-    if((Size & ((1 << APPLE_SART_V2_CONFIG_SIZE_SHIFT) - 1)) || (PhysicalAddress & ((1 << APPLE_SART_V2_PHYS_ADDR_SHIFT) - 1))) {
-        DEBUG((DEBUG_INFO, "%a: ((Size & ((1 << APPLE_SART_V2_CONFIG_SIZE_SHIFT) - 1)) || (PhysicalAddress & ((1 << APPLE_SART_V2_PHYS_ADDR_SHIFT) - 1))) check hit, returning FALSE\n", __FUNCTION__));
+    Config = MmioRead32(Sart->BaseAddress + APPLE_SART_V2_V3_CONFIG(Index));
+    Address = MmioRead32(Sart->BaseAddress + APPLE_SART_V2_PHYS_ADDR(Index));
+
+    Entry->Address = (UINT64)(Address) << APPLE_SART_V2_PHYS_ADDR_SHIFT;
+    Entry->Size = (UINT64)(FIELD_GET(APPLE_SART_V2_CONFIG_SIZE, Config)) << APPLE_SART_V2_CONFIG_SIZE_SHIFT;
+    Entry->Flags = FIELD_GET(APPLE_SART_V2_CONFIG_FLAGS, Config);
+}
+
+STATIC
+BOOLEAN
+SARTV2SetEntry(
+    IN APPLE_SART *Sart,
+    IN UINTN Index,
+    IN APPLE_SART_ENTRY *Entry
+) {
+    UINT32 Config;
+    UINT32 Address;
+    UINT32 Size;
+
+    if ((Entry->Address & ((1 << APPLE_SART_V2_PHYS_ADDR_SHIFT) - 1)) != 0) {
+        DEBUG((DEBUG_ERROR, "SARTV2SetEntry: Address 0x%lx is not properly aligned.\n", Entry->Address));
         return FALSE;
     }
-    Size = Size >> APPLE_SART_V2_CONFIG_SIZE_SHIFT;
-    PhysicalAddress = PhysicalAddress >> APPLE_SART_V2_PHYS_ADDR_SHIFT;
-    if(Size > APPLE_SART_V2_CONFIG_SIZE_MAX) {
-        DEBUG((DEBUG_INFO, "%a: Size is greater than SARTv2 CONFIG_MAX_SIZE, returning FALSE\n"));
+
+    if ((Entry->Size & ((1 << APPLE_SART_V2_CONFIG_SIZE_SHIFT) - 1)) != 0) {
+        DEBUG((DEBUG_ERROR, "SARTV2SetEntry: Size 0x%lx is not properly aligned.\n", Entry->Size));
         return FALSE;
     }
 
-    Config = FIELD_PREP(APPLE_SART_V2_CONFIG_FLAGS, Flags);
+    Config = 0;
+    Address = (UINT32)(Entry->Address >> APPLE_SART_V2_PHYS_ADDR_SHIFT);
+    Size = (UINT32)(Entry->Size >> APPLE_SART_V2_CONFIG_SIZE_SHIFT);
+
+    if (Size > APPLE_SART_V2_CONFIG_SIZE_MAX) {
+        DEBUG((DEBUG_ERROR, "SARTV2SetEntry: Size 0x%lx exceeds maximum allowed size.\n", Entry->Size));
+        return FALSE;
+    }
+
+    Config |= FIELD_PREP(APPLE_SART_V2_CONFIG_FLAGS, Entry->Flags);
     Config |= FIELD_PREP(APPLE_SART_V2_CONFIG_SIZE, Size);
-    DEBUG((DEBUG_INFO, "%a: Writing to SART at 0x%llx, index %d, with physical address 0x%llx, config flags 0x%d\n", __FUNCTION__, SartDev->SARTBaseAddress, Index, PhysicalAddress, Config));
-    MmioWrite32(((SartDev->SARTBaseAddress) + APPLE_SART_V2_PHYS_ADDR(Index)), PhysicalAddress);
-    MmioWrite32(((SartDev->SARTBaseAddress) + APPLE_SART_V2_V3_CONFIG(Index)), Config);
 
-}
+    MmioWrite32(Sart->BaseAddress + APPLE_SART_V2_PHYS_ADDR(Index), Address);
+    MmioWrite32(Sart->BaseAddress + APPLE_SART_V2_V3_CONFIG(Index), Config);
 
-
-//
-//  Description:
-//    Gets a SARTv3 entry, and it's protection/DMA allowed status.
-//
-//  Return value:
-//    None.
-//
-//  Notes:
-//    Should only be called from the public AppleSARTGetEntry function.
-//
-STATIC VOID AppleSARTV3GetEntry(SART_DEVICE *SartDev, UINT32 Index, UINT8 *Flags, VOID **PhysAddr, size_t *Size) {
-    *Flags = MmioRead32(((SartDev->SARTBaseAddress) + APPLE_SART_V2_V3_CONFIG(Index)));
-    *Size = (size_t)(MmioRead32(((SartDev->SARTBaseAddress) + APPLE_SART_V3_SIZE(Index))) << APPLE_SART_V2_V3_SIZE_SHIFT);
-    *PhysAddr = (VOID *)((UINT64)((MmioRead32(((SartDev->SARTBaseAddress) + APPLE_SART_V3_PHYS_ADDR(Index)))) << APPLE_SART_V3_PHYS_ADDR_SHIFT));
-    DEBUG((DEBUG_INFO, "%a: SART entry %d has flags 0x%x, physical address 0x%p, size 0x%lx\n", __FUNCTION__, *Flags, *PhysAddr, *Size));
-}
-
-//
-//  Description:
-//    Sets a SARTv3 entry, and it's protection/DMA allowed status.
-//
-//  Return value:
-//    TRUE if successful, FALSE otherwise.
-//
-//  Notes:
-//    Should only be called from the public AppleSARTSetEntry function.
-//
-STATIC BOOLEAN AppleSARTV3SetEntry(SART_DEVICE *SartDev, UINT32 Index, UINT8 Flags, VOID *PhysAddr, size_t Size) {
-    UINT64 PhysicalAddress = (UINT64)PhysAddr;
-    if((Size & ((1 << APPLE_SART_V2_V3_SIZE_SHIFT) - 1)) || (PhysicalAddress & ((1 << APPLE_SART_V3_PHYS_ADDR_SHIFT) - 1))) {
-        DEBUG((DEBUG_INFO, "%a: ((Size & ((1 << APPLE_SART_V2_V3_SIZE_SHIFT) - 1)) || (PhysicalAddress & ((1 << APPLE_SART_V3_PHYS_ADDR_SHIFT) - 1))) check hit, returning FALSE\n", __FUNCTION__));
-        return FALSE;
-    }
-    PhysicalAddress = PhysicalAddress >> APPLE_SART_V3_PHYS_ADDR_SHIFT;
-    Size = Size >> APPLE_SART_V2_V3_SIZE_SHIFT;
-
-    if(Size > APPLE_SART_V3_MAX_SIZE) {
-        DEBUG((DEBUG_INFO, "%a: Size is greater than SARTv3 MAX_SIZE, returning FALSE\n", __FUNCTION__));
-        return FALSE;
-    }
-    DEBUG((DEBUG_INFO, "%a: Writing to SART at 0x%llx, index %d, with physical address 0x%llx, size 0x%x, config flags 0x%llx\n", __FUNCTION__, SartDev->SARTBaseAddress, Index, PhysicalAddress, Size, Flags));
-    MmioWrite32(((SartDev->SARTBaseAddress) + APPLE_SART_V3_PHYS_ADDR(Index)), PhysAddr);
-    MmioWrite32(((SartDev->SARTBaseAddress) + APPLE_SART_V3_SIZE(Index)), Size);
-    MmioWrite32(((SartDev->SARTBaseAddress) + APPLE_SART_V2_V3_CONFIG(Index)), Flags);
     return TRUE;
 }
 
-//
-//  Description:
-//    Gets a SART entry, and it's protection/DMA allowed status.
-//
-//  Return value:
-//    None.
-//
-VOID AppleSARTGetEntry(SART_DEVICE *SartDev, UINT32 Index, UINT8 *Flags, VOID **PhysAddr, size_t *Size) {
-    UINT8 SARTVersion = FixedPcdGet8(PcdAppleSartVersion);
-    switch(SARTVersion) {
-        case 1:
-            //
-            // This is a SART v1, so we're most likely running on Skye (A11). (Not sure about Cyprus/A12 or Cebu/A13)
-            // Support for this is unimplemented right now, but will be added later,
-            // so for now indicate to the user that SARTv1 is unsupported but will be added.
-            //
-            // TODO: Add SARTv1 support.
-            //
-            DEBUG((DEBUG_ERROR | DEBUG_INFO, "%a: SARTv1 is unsupported for now, exiting\n", __FUNCTION__));
-            break;
-        //
-        // This is a SARTv2 or SARTv3, call the appropriate function for the SART version.
-        //
-        case 2:
-            DEBUG((DEBUG_INFO, "%a: Getting SARTv2 entry %d, Flags pointer %p, PhysAddr %p, Size pointer %p\n", __FUNCTION__, Index, Flags, *PhysAddr, Size));
-            AppleSARTV2GetEntry(SartDev, Index, Flags, PhysAddr, Size);
-            break;
-        case 3:
-            DEBUG((DEBUG_INFO, "%a: Getting SARTv3 entry %d, Flags pointer %p, PhysAddr %p, Size pointer %p\n", __FUNCTION__, Index, Flags, *PhysAddr, Size));
-            AppleSARTV3GetEntry(SartDev, Index, Flags, PhysAddr, Size);
-            break;
-        default:
-            //
-            // Unrecognized SART, or SART version not set, inform the user.
-            //
-            DEBUG((DEBUG_ERROR, "%a: Unrecognized SART version, exiting\n", __FUNCTION__));
-            break;
-    }
+STATIC
+VOID
+SARTV3GetEntry(
+    IN APPLE_SART *Sart,
+    IN UINTN Index,
+    OUT APPLE_SART_ENTRY *Entry
+) {
+    UINT32 Config;
+    UINT32 Address;
+    UINT32 Size;
+
+    Config = MmioRead32(Sart->BaseAddress + APPLE_SART_V2_V3_CONFIG(Index));
+    Address = MmioRead32(Sart->BaseAddress + APPLE_SART_V3_PHYS_ADDR(Index));
+    Size = MmioRead32(Sart->BaseAddress + APPLE_SART_V3_SIZE(Index));
+
+    Entry->Address = (UINT64)(Address) << APPLE_SART_V3_PHYS_ADDR_SHIFT;
+    Entry->Size = (UINT64)(Size) << APPLE_SART_V2_V3_SIZE_SHIFT;
+    Entry->Flags = Config;
 }
 
-BOOLEAN AppleSARTSetEntry(SART_DEVICE *SartDev, UINT32 Index, UINT8 Flags, VOID *PhysAddr, size_t Size) {
-    UINT8 SARTVersion = FixedPcdGet8(PcdAppleSartVersion);
-    switch(SARTVersion) {
-        case 1:
-            //
-            // This is a SART v1, so we're most likely running on Skye (A11). (Not sure about Cyprus/A12 or Cebu/A13)
-            // Support for this is unimplemented right now, but will be added later,
-            // so for now indicate to the user that SARTv1 is unsupported but will be added.
-            //
-            // TODO: Add SARTv1 support.
-            //
-            DEBUG((DEBUG_ERROR | DEBUG_INFO, "%a: SARTv1 is unsupported for now, exiting\n", __FUNCTION__));
-            break;
-        //
-        // This is a SARTv2 or SARTv3, call the appropriate function for the SART version.
-        //
-        case 2:
-            DEBUG((DEBUG_INFO, "%a: Setting SARTv2 entry %d, Flags 0x%x, PhysAddr %p, Size 0x%x\n", __FUNCTION__, Index, Flags, PhysAddr, Size));
-            AppleSARTV2SetEntry(SartDev, Index, Flags, PhysAddr, Size);
-            break;
-        case 3:
-            DEBUG((DEBUG_INFO, "%a: Setting SARTv3 entry %d, Flags 0x%x, PhysAddr %p, Size 0x%x\n", __FUNCTION__, Index, Flags, PhysAddr, Size));
-            AppleSARTV3SetEntry(SartDev, Index, Flags, PhysAddr, Size);
-            break;
-        default:
-            //
-            // Unrecognized SART, or SART version not set, inform the user.
-            //
-            DEBUG((DEBUG_ERROR, "%a: Unrecognized SART version, exiting\n", __FUNCTION__));
-            break;
+STATIC
+BOOLEAN
+SARTV3SetEntry(
+    IN APPLE_SART *Sart,
+    IN UINTN Index,
+    IN APPLE_SART_ENTRY *Entry
+) {
+    UINT32 Config;
+    UINT32 Address;
+    UINT32 Size;
+
+    if ((Entry->Address & ((1 << APPLE_SART_V3_PHYS_ADDR_SHIFT) - 1)) != 0) {
+        DEBUG((DEBUG_ERROR, "SARTV3GetEntry: Address 0x%lx is not properly aligned.\n", Entry->Address));
+        return FALSE;
     }
+
+    if ((Entry->Size & ((1 << APPLE_SART_V2_V3_SIZE_SHIFT) - 1)) != 0) {
+        DEBUG((DEBUG_ERROR, "SARTV3GetEntry: Size 0x%lx is not properly aligned.\n", Entry->Size));
+        return FALSE;
+    }
+
+    Config = Entry->Flags;
+    Address = (UINT32)(Entry->Address >> APPLE_SART_V3_PHYS_ADDR_SHIFT);
+    Size = (UINT32)(Entry->Size >> APPLE_SART_V2_V3_SIZE_SHIFT);
+
+    if (Size > APPLE_SART_V3_MAX_SIZE) {
+        DEBUG((DEBUG_ERROR, "SARTV3SetEntry: Size 0x%lx exceeds maximum allowed size.\n", Entry->Size));
+        return FALSE;
+    }
+
+    MmioWrite32(Sart->BaseAddress + APPLE_SART_V3_PHYS_ADDR(Index), Address);
+    MmioWrite32(Sart->BaseAddress + APPLE_SART_V3_SIZE(Index), Size);
+    MmioWrite32(Sart->BaseAddress + APPLE_SART_V2_V3_CONFIG(Index), Config);
+
+    return TRUE;
 }
 
-EFI_STATUS EFIAPI AppleSARTLibInitialize(VOID) {
-    UINT64 SARTBase = 0;
-    SART_DEVICE *SartInstance;
-    dt_node_t *SARTNode;
-    UINT32 Length;
-    UINT8 SARTVersion = FixedPcdGet8(PcdAppleSartVersion);
-    //
-    // Aside: why is the ANS controller on the second die on multi die systems...
-    //
+APPLE_SART *
+EFIAPI
+AppleSARTInitialize(
+    IN UINT64 BaseAddress
+) {
+    APPLE_SART *Sart;
 
-    SARTNode = dt_get("sart-ans");
-    dt_node_reg(SARTNode, 0, &SARTBase, NULL);
+    Sart = AllocateZeroPool(sizeof(APPLE_SART));
 
-    SartInstance = AllocateZeroPool(sizeof(SART_DEVICE));
-    if(SartInstance == NULL) {
-        DEBUG((DEBUG_INFO, "%a: Out of RAM, can't allocate space for SART device info, exiting\n", __FUNCTION__));
-        return EFI_OUT_OF_RESOURCES;
+    if (Sart == NULL) {
+        return NULL;
     }
-    SartInstance->SARTBaseAddress = SARTBase;
-    DEBUG((DEBUG_INFO, "%a: SART version %d at 0x%llx\n", __FUNCTION__, SARTVersion, SARTBase));
-    SartInstance->SARTProtectedEntries = 0;
-    for(UINT32 i = 0; i < APPLE_SART_MAX_ENTRIES; i++) {
-        VOID *PhysAddr;
-        UINT8 Flags;
-        size_t Size;
 
-        AppleSARTGetEntry(SartInstance, i, &Flags, &PhysAddr, &Size);
-        if(Flags) {
-            SartInstance->SARTProtectedEntries |= (1 << i);
+    switch (FixedPcdGet8(PcdAppleSartVersion)) {
+        case 2:
+            DEBUG((DEBUG_INFO, "AppleSARTInitialize: Initializing SARTv2 at 0x%llx.\n", BaseAddress));
+            Sart->GetEntry = SARTV2GetEntry;
+            Sart->SetEntry = SARTV2SetEntry;
+            break;
+        case 3:
+            DEBUG((DEBUG_INFO, "AppleSARTInitialize: Initializing SARTv3 at 0x%llx.\n", BaseAddress));
+            Sart->GetEntry = SARTV3GetEntry;
+            Sart->SetEntry = SARTV3SetEntry;
+            break;
+        default:
+            DEBUG((DEBUG_INFO, "AppleSARTInitialize: Unknown SART version %d.\n", FixedPcdGet8(PcdAppleSartVersion)));
+            FreePool(Sart);
+            return NULL;
+    }
+
+    Sart->BaseAddress = BaseAddress;
+    Sart->ProtectedEntries = 0;
+
+    // Find out which entries were initialized prior to us and mark them as protected.
+    for (UINTN Index = 0; Index < APPLE_SART_MAX_ENTRIES; Index++) {
+        APPLE_SART_ENTRY Entry;
+
+        Sart->GetEntry(Sart, Index, &Entry);
+
+        if (Entry.Flags != 0) {
+            Sart->ProtectedEntries |= BIT(Index);
         }
     }
-    return EFI_SUCCESS;
 
+    return Sart;
+}
+
+VOID
+EFIAPI
+AppleSARTDeinitialize(
+    IN APPLE_SART *Sart
+) {
+    if (Sart == NULL) {
+        return;
+    }
+
+    // Clear all non-protected entries.
+    for (UINTN Index = 0; Index < APPLE_SART_MAX_ENTRIES; Index++) {
+        if ((Sart->ProtectedEntries & BIT(Index)) == 0) {
+            APPLE_SART_ENTRY Entry;
+
+            Entry.Address = 0;
+            Entry.Size = 0;
+            Entry.Flags = 0;
+
+            if (!Sart->SetEntry(Sart, Index, &Entry)) {
+                DEBUG((DEBUG_INFO, "AppleSARTDeinitialize: Failed to clear SART entry %d.\n", Index));
+            }
+        }
+    }
+
+    FreePool(Sart);
+}
+
+EFI_STATUS
+EFIAPI
+AppleSARTAddEntry(
+    IN APPLE_SART *Sart,
+    IN APPLE_SART_ENTRY *Entry
+) {
+    UINTN Index;
+
+    // Find a free entry.
+    for (Index = 0; Index < APPLE_SART_MAX_ENTRIES; Index++) {
+        if ((Sart->ProtectedEntries & BIT(Index)) == 0) {
+            break;
+        }
+    }
+
+    if (Index == APPLE_SART_MAX_ENTRIES) {
+        DEBUG((DEBUG_INFO, "AppleSARTAddEntry: No free SART entries available.\n"));
+        return EFI_OUT_OF_RESOURCES;
+    }
+
+    // Set the entry.
+    if (!Sart->SetEntry(Sart, Index, Entry)) {
+        DEBUG((DEBUG_INFO, "AppleSARTAddEntry: Failed to set SART entry %d.\n", Index));
+        return EFI_INVALID_PARAMETER;
+    }
+
+    return EFI_SUCCESS;
+}
+
+EFI_STATUS
+EFIAPI
+AppleSARTRemoveEntry(
+    IN APPLE_SART *Sart,
+    IN APPLE_SART_ENTRY *Entry
+) {
+    UINTN Index;
+    APPLE_SART_ENTRY CurrentEntry;
+
+    // Find the entry.
+    for (Index = 0; Index < APPLE_SART_MAX_ENTRIES; Index++) {
+        Sart->GetEntry(Sart, Index, &CurrentEntry);
+
+        if ((CurrentEntry.Address == Entry->Address) &&
+            (CurrentEntry.Size == Entry->Size) &&
+            (CurrentEntry.Flags == Entry->Flags)) {
+            break;
+        }
+    }
+
+    if (Index == APPLE_SART_MAX_ENTRIES) {
+        DEBUG((DEBUG_INFO, "AppleSARTRemoveEntry: SART entry not found.\n"));
+        return EFI_NOT_FOUND;
+    }
+
+    // Clear the entry.
+    CurrentEntry.Address = 0;
+    CurrentEntry.Size = 0;
+    CurrentEntry.Flags = 0;
+
+    EFI_STATUS Status = Sart->SetEntry(Sart, Index, &CurrentEntry);
+
+    // This should never fail.
+    ASSERT(Status == EFI_SUCCESS);
+
+    return EFI_SUCCESS;
 }

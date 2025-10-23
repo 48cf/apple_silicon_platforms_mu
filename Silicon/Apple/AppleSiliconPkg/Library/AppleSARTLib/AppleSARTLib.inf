@@ -24,8 +24,6 @@
   MODULE_TYPE                    = BASE
   VERSION_STRING                 = 1.0
   LIBRARY_CLASS                  = AppleSARTLib
-  CONSTRUCTOR                    = AppleSARTLibInitialize
-
 
 [Sources]
   AppleSARTLib.c
@@ -40,13 +38,10 @@
   ArmLib
   PcdLib
   IoLib
-  HobLib
   CompilerIntrinsicsLib
   UefiLib
   MemoryAllocationLib
-  UefiBootServicesTableLib
   DebugLib
-  AppleDTLib
 
 [FixedPcd]
   gAppleSiliconPkgTokenSpaceGuid.PcdAppleSartVersion

@@ -240,9 +240,11 @@
   # Apple Mailbox interface library
   AppleMailboxLib|AppleSiliconPkg/Library/AppleMailboxLib/AppleMailboxLib.inf
 
+  # Apple SART interface library
+  AppleSARTLib|AppleSiliconPkg/Library/AppleSARTLib/AppleSARTLib.inf
+
   # USB Libraries
   UefiUsbLib|MdePkg/Library/UefiUsbLib/UefiUsbLib.inf
-
 
   #
   # CryptoPkg libraries needed by multiple firmware features
