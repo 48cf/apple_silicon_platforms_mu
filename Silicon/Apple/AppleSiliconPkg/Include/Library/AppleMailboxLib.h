@@ -19,9 +19,7 @@
 #ifndef APPLE_MAILBOX_LIB_H
 #define APPLE_MAILBOX_LIB_H
 
-typedef struct _APPLE_MAILBOX {
-    UINTN BaseAddress;
-} APPLE_MAILBOX;
+typedef struct _APPLE_MAILBOX  APPLE_MAILBOX;
 
 typedef struct _APPLE_MAILBOX_MESSAGE {
     UINT64 Message0;
@@ -73,6 +71,21 @@ EFIAPI
 AppleMailboxReceiveMessage(
     IN APPLE_MAILBOX *Mailbox,
     OUT APPLE_MAILBOX_MESSAGE *Message
+);
+
+/**
+ * Receive a message from the specified mailbox with a timeout.
+ * @param Mailbox - Pointer to the APPLE_MAILBOX structure to initialize.
+ * @param Message - Pointer to the APPLE_MAILBOX_MESSAGE structure to store the received message
+ * @param Timeout - Timeout in microseconds to wait for a message.
+ * @return EFI_STATUS - If a message was received successfully, returns EFI_SUCCESS; otherwise, returns EFI_TIMEOUT.
+ */
+EFI_STATUS
+EFIAPI
+AppleMailboxReceiveMessageWithTimeout(
+    IN APPLE_MAILBOX *Mailbox,
+    OUT APPLE_MAILBOX_MESSAGE *Message,
+    IN UINTN Timeout
 );
 
 #endif // APPLE_MAILBOX_LIB_H

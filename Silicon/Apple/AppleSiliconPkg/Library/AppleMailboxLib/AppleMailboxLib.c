@@ -18,11 +18,17 @@
 // This driver only implements support for the ASC mailboxes for now.
 
 #include <Library/AppleMailboxLib.h>
+#include <Library/ArmLib.h>
 #include <Library/DebugLib.h>
 #include <Library/IoLib.h>
 #include <Library/MemoryAllocationLib.h>
+#include <Library/TimerLib.h>
 
-// Register definitions for ASC, borrowed from the m1n1 driver.
+struct _APPLE_MAILBOX {
+    UINTN BaseAddress;
+};
+
+// Register definitions borrowed from the m1n1 driver.
 #define ASC_CPU_CONTROL_REG 0x44
 #define ASC_CPU_CONTROL_START BIT4
 
@@ -30,13 +36,9 @@
 #define ASC_MBOX_A2I_CONTROL_REG 0x110
 #define ASC_MBOX_A2I_SEND0_REG 0x800
 #define ASC_MBOX_A2I_SEND1_REG 0x808
-#define ASC_MBOX_A2I_RECV0_REG 0x810
-#define ASC_MBOX_A2I_RECV1_REG 0x818
 
 // I2A registers (co-processor to CPU)
 #define ASC_MBOX_I2A_CONTROL_REG 0x114
-#define ASC_MBOX_I2A_SEND0_REG 0x820
-#define ASC_MBOX_I2A_SEND1_REG 0x828
 #define ASC_MBOX_I2A_RECV0_REG 0x830
 #define ASC_MBOX_I2A_RECV1_REG 0x838
 
@@ -141,7 +143,7 @@ AppleMailboxSendMessage(
     }
 
     // Make sure the mailbox is not full.
-    if (MailboxRead64(Mailbox, ASC_MBOX_A2I_CONTROL_REG) & ASC_MBOX_CONTROL_FULL) {
+    if (MailboxRead32(Mailbox, ASC_MBOX_A2I_CONTROL_REG) & ASC_MBOX_CONTROL_FULL) {
         return EFI_NOT_READY;
     }
 
@@ -163,7 +165,7 @@ AppleMailboxReceiveMessage(
     }
 
     // Make sure the mailbox is not empty.
-    if (MailboxRead64(Mailbox, ASC_MBOX_I2A_CONTROL_REG) & ASC_MBOX_CONTROL_EMPTY) {
+    if (MailboxRead32(Mailbox, ASC_MBOX_I2A_CONTROL_REG) & ASC_MBOX_CONTROL_EMPTY) {
         return EFI_NOT_READY;
     }
 
@@ -172,4 +174,32 @@ AppleMailboxReceiveMessage(
     Message->Message1 = (UINT32)MailboxRead64(Mailbox, ASC_MBOX_I2A_RECV1_REG);
 
     return EFI_SUCCESS;
+}
+
+EFI_STATUS
+EFIAPI
+AppleMailboxReceiveMessageWithTimeout(
+    IN APPLE_MAILBOX *Mailbox,
+    OUT APPLE_MAILBOX_MESSAGE *Message,
+    IN UINTN Timeout
+) {
+    EFI_STATUS Status;
+    UINTN ElapsedTime;
+
+    if (Mailbox == NULL || Message == NULL) {
+        return EFI_INVALID_PARAMETER;
+    }
+
+    ElapsedTime = 0;
+    Status = AppleMailboxReceiveMessage(Mailbox, Message);
+
+    while (EFI_ERROR(Status) && ElapsedTime < Timeout) {
+        // Wait up to 100 microseconds and try again until timeout.
+        MicroSecondDelay(100);
+
+        ElapsedTime += 100;
+        Status = AppleMailboxReceiveMessage(Mailbox, Message);
+    }
+
+    return EFI_ERROR(Status) ? EFI_TIMEOUT : EFI_SUCCESS;
 }
