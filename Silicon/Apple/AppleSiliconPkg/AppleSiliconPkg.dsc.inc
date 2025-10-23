@@ -240,6 +240,9 @@
   # Apple Mailbox interface library
   AppleMailboxLib|AppleSiliconPkg/Library/AppleMailboxLib/AppleMailboxLib.inf
 
+  # Apple RTKit interface library
+  AppleRTKitLib|AppleSiliconPkg/Library/AppleRTKitLib/AppleRTKitLib.inf
+
   # Apple SART interface library
   AppleSARTLib|AppleSiliconPkg/Library/AppleSARTLib/AppleSARTLib.inf
 

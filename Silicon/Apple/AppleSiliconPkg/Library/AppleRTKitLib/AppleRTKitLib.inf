@@ -1,0 +1,37 @@
+#
+#  Copyright (c) 2025, AppleWOA authors. All rights reserved.
+#
+#  Module Name:
+#    AppleRTKitLib.inf
+#  
+#  Abstract:
+#     Simple library to interface with the Apple RTKit firmware.
+#
+#  Environment:
+#     UEFI DXE (Driver Execution Environment) and runtime services.
+#
+#  License:
+#    SPDX-License-Identifier: MIT
+#
+
+[Defines]
+  INF_VERSION                    = 0x0001001c
+  BASE_NAME                      = AppleRTKitLib
+  FILE_GUID                      = dc626dbf-dd9a-444e-b78b-d57da38f42b0
+  MODULE_TYPE                    = BASE
+  VERSION_STRING                 = 1.0
+  LIBRARY_CLASS                  = AppleRTKitLib
+
+[Sources]
+  AppleRTKitLib.c
+
+[Packages]
+  ArmPkg/ArmPkg.dec
+  MdeModulePkg/MdeModulePkg.dec
+  MdePkg/MdePkg.dec
+  AppleSiliconPkg/AppleSiliconPkg.dec
+
+[LibraryClasses]
+  AppleMailboxLib
+  IoLib
+  CompilerIntrinsicsLib

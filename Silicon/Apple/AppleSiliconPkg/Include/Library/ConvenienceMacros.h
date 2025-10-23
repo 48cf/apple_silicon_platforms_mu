@@ -17,7 +17,7 @@
 #define CONVENIENCE_MACROS_H
 
 //borrowed from m1n1
-#define BIT(x) (1UL << (x))
+#define BIT(x) (1ULL << (x))
 #define GENMASK(msb, lsb) ((BIT((msb + 1) - (lsb)) - 1) << (lsb))
 
 //While EDK2 does have code that reads bitfields from values, the m1n1 bitfield macros
