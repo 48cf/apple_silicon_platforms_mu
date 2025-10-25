@@ -263,7 +263,15 @@ AppleSARTAddEntry(
 
     // Find a free entry.
     for (Index = 0; Index < APPLE_SART_MAX_ENTRIES; Index++) {
-        if ((Sart->ProtectedEntries & BIT(Index)) == 0) {
+        if ((Sart->ProtectedEntries & BIT(Index)) != 0) {
+            continue;
+        }
+
+        APPLE_SART_ENTRY CurrentEntry;
+
+        Sart->GetEntry(Sart, Index, &CurrentEntry);
+
+        if (CurrentEntry.Flags == 0) {
             break;
         }
     }

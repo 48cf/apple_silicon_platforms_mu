@@ -26,6 +26,7 @@
 #define RTKIT_MAX_VERSION 12
 
 #define RTKIT_MANAGEMENT_MESSAGE_TYPE GENMASK(59, 52)
+#define RTKIT_OSLOG_MESSAGE_TYPE GENMASK(63, 56)
 
 #define RTKIT_HELLO_MIN_VERSION GENMASK(15, 0)
 #define RTKIT_HELLO_MAX_VERSION GENMASK(31, 16)
@@ -40,7 +41,11 @@
 
 #define RTKIT_BUFFER_REQUEST 1
 #define RTKIT_BUFFER_REQUEST_SIZE GENMASK(51, 44)
-#define RTKIT_BUFFER_REQUEST_IOVA GENMASK(43, 0)
+#define RTKIT_BUFFER_REQUEST_IOVA GENMASK(41, 0)
+
+#define RTKIT_OSLOG_BUFFER_REQUEST_SIZE GENMASK(55, 36)
+#define RTKIT_OSLOG_BUFFER_REQUEST_IOVA GENMASK(35, 0)
+
 
 typedef enum {
     RTKIT_ENDPOINT_MANAGEMENT = 0,
@@ -49,6 +54,7 @@ typedef enum {
     RTKIT_ENDPOINT_DEBUG = 3,
     RTKIT_ENDPOINT_IOREPORT = 4,
     RTKIT_ENDPOINT_OSLOG = 8,
+    RTKIT_ENDPOINT_TRACEKIT = 10,
 } RTKIT_ENDPOINT;
 
 typedef enum {
@@ -78,6 +84,7 @@ struct _APPLE_RTKIT {
 
     VOID *ShmemContext;
 
+    UINT64 Endpoints[4]; // 4 * 64 = 256
     BOOLEAN Crashed;
 
     UINT32 IopPowerState;
@@ -89,29 +96,38 @@ struct _APPLE_RTKIT {
 };
 
 STATIC
-VOID
-PrepareMessage(
-    OUT APPLE_MAILBOX_MESSAGE *MailboxMessage,
+EFI_STATUS
+RTKitSendMessage(
+    IN APPLE_RTKIT *RtKit,
     IN RTKIT_ENDPOINT Endpoint,
     IN UINT64 Message
 ) {
-    MailboxMessage->Message0 = Message;
-    MailboxMessage->Message1 = Endpoint;
+    APPLE_MAILBOX_MESSAGE MailboxMessage;
+
+    MailboxMessage.Message0 = Message;
+    MailboxMessage.Message1 = Endpoint;
+
+    return AppleMailboxSendMessage(RtKit->Mailbox, &MailboxMessage);
 }
 
 STATIC
-VOID
-PrepareManagementMessage(
-    OUT APPLE_MAILBOX_MESSAGE *MailboxMessage,
-    IN RTKIT_MANAGEMENT_MESSAGE Type,
-    IN UINT64 Message
+EFI_STATUS
+RTKitReceiveMessage(
+    IN APPLE_RTKIT *RtKit,
+    OUT APPLE_RTKIT_MESSAGE *Message,
+    IN UINTN Timeout
 ) {
-    UINT64 Payload = 0;
+    EFI_STATUS Status;
+    APPLE_MAILBOX_MESSAGE MailboxMessage;
 
-    Payload |= FIELD_PREP(RTKIT_MANAGEMENT_MESSAGE_TYPE, (UINT64)Type);
-    Payload |= Message;
+    Status = AppleMailboxReceiveMessageWithTimeout(RtKit->Mailbox, &MailboxMessage, Timeout);
 
-    PrepareMessage(MailboxMessage, RTKIT_ENDPOINT_MANAGEMENT, Payload);
+    if (Status == EFI_SUCCESS) {
+        Message->Message = MailboxMessage.Message0;
+        Message->Endpoint = MailboxMessage.Message1;
+    }
+
+    return Status;
 }
 
 STATIC
@@ -122,12 +138,17 @@ HandleBufferRequest(
     IN OUT APPLE_RTKIT_BUFFER *Buffer
 ) {
     EFI_STATUS Status;
-    APPLE_MAILBOX_MESSAGE Reply;
-    UINT64 DeviceAddress;
-    UINTN Size;
 
-    DeviceAddress = FIELD_GET(RTKIT_BUFFER_REQUEST_IOVA, Message->Message);
-    Size = FIELD_GET(RTKIT_BUFFER_REQUEST_SIZE, Message->Message) << 12; // Size in 4KiB pages
+    UINT64 DeviceAddress;
+    UINT32 Size;
+
+    if (Message->Endpoint == RTKIT_ENDPOINT_OSLOG) {
+        DeviceAddress = FIELD_GET(RTKIT_OSLOG_BUFFER_REQUEST_IOVA, Message->Message) << 12;
+        Size = FIELD_GET(RTKIT_OSLOG_BUFFER_REQUEST_SIZE, Message->Message);
+    } else {
+        DeviceAddress = FIELD_GET(RTKIT_BUFFER_REQUEST_IOVA, Message->Message);
+        Size = FIELD_GET(RTKIT_BUFFER_REQUEST_SIZE, Message->Message) << 12;
+    }
 
     Buffer->Endpoint = Message->Endpoint;
     Buffer->DeviceAddress = DeviceAddress;
@@ -145,22 +166,164 @@ HandleBufferRequest(
         return EFI_UNSUPPORTED;
     }
 
-    UINT64 ReplyPayload = 0;
+    UINT64 ReplyMessage;
 
-    ReplyPayload |= FIELD_PREP(RTKIT_MANAGEMENT_MESSAGE_TYPE, RTKIT_BUFFER_REQUEST);
-    ReplyPayload |= FIELD_PREP(RTKIT_BUFFER_REQUEST_IOVA, Buffer->DeviceAddress);
-    ReplyPayload |= FIELD_PREP(RTKIT_BUFFER_REQUEST_SIZE, Buffer->Size >> 12);
+    if (Message->Endpoint == RTKIT_ENDPOINT_OSLOG) {
+        ReplyMessage =
+            FIELD_PREP(RTKIT_OSLOG_MESSAGE_TYPE, RTKIT_BUFFER_REQUEST) |
+            FIELD_PREP(RTKIT_OSLOG_BUFFER_REQUEST_IOVA, Buffer->DeviceAddress) |
+            FIELD_PREP(RTKIT_OSLOG_BUFFER_REQUEST_SIZE, Buffer->Size >> 12);
+    } else {
+        ReplyMessage =
+            FIELD_PREP(RTKIT_MANAGEMENT_MESSAGE_TYPE, RTKIT_BUFFER_REQUEST) |
+            FIELD_PREP(RTKIT_BUFFER_REQUEST_IOVA, Buffer->DeviceAddress) |
+            FIELD_PREP(RTKIT_BUFFER_REQUEST_SIZE, Buffer->Size >> 12);
+    }
 
-    PrepareMessage(&Reply, Message->Endpoint, ReplyPayload);
-
-    Status = AppleMailboxSendMessage(RtKit->Mailbox, &Reply);
+    Status = RTKitSendMessage(RtKit, Message->Endpoint, ReplyMessage);
 
     if (EFI_ERROR(Status)) {
-        DEBUG((DEBUG_ERROR, "HandleBufferRequest: Failed to send buffer request reply for endpoint %u: %r\n", Message->Endpoint, Status));
+        DEBUG((DEBUG_ERROR, "HandleBufferRequest: Failed to send buffer request reply: %r\n", Status));
         return Status;
     }
 
     return EFI_SUCCESS;
+}
+
+STATIC
+EFI_STATUS
+HandleManagementMessage(
+    IN APPLE_RTKIT *RtKit,
+    IN APPLE_RTKIT_MESSAGE *Message
+) {
+    UINT8 MessageType = FIELD_GET(RTKIT_MANAGEMENT_MESSAGE_TYPE, Message->Message);
+
+    if (MessageType == RTKIT_MANAGEMENT_MESSAGE_HELLO) {
+        UINT16 MinVersion = FIELD_GET(RTKIT_HELLO_MIN_VERSION, Message->Message);
+        UINT16 MaxVersion = FIELD_GET(RTKIT_HELLO_MAX_VERSION, Message->Message);
+
+        if (MinVersion > RTKIT_MAX_VERSION || MaxVersion < RTKIT_MIN_VERSION) {
+            DEBUG((DEBUG_ERROR, "HandleManagementMessage: Incompatible RTKit version: min %u, max %u\n", MinVersion, MaxVersion));
+            return EFI_UNSUPPORTED;
+        }
+
+        UINT16 Version = MIN(MaxVersion, RTKIT_MAX_VERSION);
+        UINT64 ReplyMessage =
+            FIELD_PREP(RTKIT_MANAGEMENT_MESSAGE_TYPE, RTKIT_MANAGEMENT_MESSAGE_HELLO_ACK) |
+            FIELD_PREP(RTKIT_HELLO_MIN_VERSION, Version) |
+            FIELD_PREP(RTKIT_HELLO_MAX_VERSION, Version);
+
+        return RTKitSendMessage(RtKit, RTKIT_ENDPOINT_MANAGEMENT, ReplyMessage);
+    } else if (MessageType == RTKIT_MANAGEMENT_MESSAGE_ENDPOINT_MAP) {
+        UINT32 Bitmap = FIELD_GET(RTKIT_ENDPOINT_MAP_BITMAP, Message->Message);
+        UINT32 Base = FIELD_GET(RTKIT_ENDPOINT_MAP_BASE, Message->Message);
+        BOOLEAN IsLast = (Message->Message & RTKIT_ENDPOINT_MAP_DONE) != 0;
+
+        for (UINT32 Index = 0; Index < 32; Index++) {
+            if ((Bitmap & BIT(Index)) == 0) {
+                continue;
+            }
+
+            UINT32 EndpointIndex = Base * 32 + Index;
+
+            RtKit->Endpoints[EndpointIndex / 64] |= BIT(EndpointIndex % 64);
+        }
+
+        UINT64 ReplyMessage =
+            FIELD_PREP(RTKIT_MANAGEMENT_MESSAGE_TYPE, RTKIT_MANAGEMENT_MESSAGE_ENDPOINT_MAP_ACK) |
+            FIELD_PREP(RTKIT_ENDPOINT_MAP_BASE, Base) |
+            (IsLast ? RTKIT_ENDPOINT_MAP_DONE : BIT0);
+        
+        EFI_STATUS Status = RTKitSendMessage(RtKit, RTKIT_ENDPOINT_MANAGEMENT, ReplyMessage);
+
+        if (EFI_ERROR(Status)) {
+            return Status;
+        }
+
+        if (!IsLast) {
+            return EFI_SUCCESS;
+        }
+
+        for (UINT32 Endpoint = 0; Endpoint < 32; Endpoint++) {
+            if (Endpoint != RTKIT_ENDPOINT_MANAGEMENT && (RtKit->Endpoints[Endpoint / 64] & BIT(Endpoint % 64)) == 0) {
+                continue;
+            }
+
+            Status = AppleRTKitStartEndpoint(RtKit, Endpoint);
+
+            if (EFI_ERROR(Status)) {
+                DEBUG((DEBUG_ERROR, "HandleManagementMessage: Failed to start endpoint %u: %r\n", Endpoint, Status));
+                return Status;
+            }
+        }
+
+        return EFI_SUCCESS;
+    } else if (MessageType == RTKIT_MANAGEMENT_MESSAGE_IOP_POWER_STATE_ACK) {
+        UINT32 PowerState = Message->Message & 0xFFFF;
+
+        RtKit->IopPowerState = PowerState;
+
+        DEBUG((DEBUG_INFO, "HandleManagementMessage: IOP power state changed to %u\n", PowerState));
+
+        return EFI_SUCCESS;
+    } else if (MessageType == RTKIT_MANAGEMENT_MESSAGE_AP_POWER_STATE_ACK) {
+        UINT32 PowerState = Message->Message & 0xFFFF;
+
+        RtKit->ApPowerState = PowerState;
+
+        DEBUG((DEBUG_INFO, "HandleManagementMessage: AP power state changed to %u\n", PowerState));
+
+        return EFI_SUCCESS;
+    }
+
+    DEBUG((DEBUG_ERROR, "HandleManagementMessage: Unknown management message type %u\n", MessageType));
+
+    return EFI_UNSUPPORTED;
+}
+
+STATIC
+EFI_STATUS
+HandleCrashlogMessage(
+    IN APPLE_RTKIT *RtKit,
+    IN APPLE_RTKIT_MESSAGE *Message
+) {
+    UINT32 MessageType = FIELD_GET(RTKIT_MANAGEMENT_MESSAGE_TYPE, Message->Message);
+
+    if (MessageType != RTKIT_BUFFER_REQUEST) {
+        DEBUG((DEBUG_ERROR, "HandleCrashlogMessage: Unknown crashlog message type %u\n", MessageType));
+        return EFI_UNSUPPORTED;
+    }
+
+    if (RtKit->CrashlogBuffer.Size == 0) {
+        return HandleBufferRequest(RtKit, Message, &RtKit->CrashlogBuffer);
+    }
+
+    RtKit->Crashed = TRUE;
+
+    // TODO: Implement dumping of the crash log buffer.
+    DEBUG((DEBUG_ERROR, "HandleCrashlogMessage: RTKit has crashed :(\n"));
+
+    return EFI_SUCCESS;
+}
+
+STATIC
+EFI_STATUS
+HandleSyslogMessage(
+    IN APPLE_RTKIT *RtKit,
+    IN APPLE_RTKIT_MESSAGE *Message
+) {
+    UINT32 MessageType = FIELD_GET(RTKIT_MANAGEMENT_MESSAGE_TYPE, Message->Message);
+
+    if (MessageType == RTKIT_BUFFER_REQUEST) {
+        return HandleBufferRequest(RtKit, Message, &RtKit->SyslogBuffer);
+    } else if (MessageType == 5) {
+        // System log message, unhandled for now but must be acked to avoid issues.
+        return RTKitSendMessage(RtKit, RTKIT_ENDPOINT_SYSLOG, Message->Message);
+    }
+
+    DEBUG((DEBUG_ERROR, "HandleSyslogMessage: Unknown syslog message type %u\n", MessageType));
+
+    return EFI_UNSUPPORTED;
 }
 
 APPLE_RTKIT *
@@ -206,220 +369,24 @@ AppleRTKitBoot(
     IN APPLE_RTKIT *RtKit
 ) {
     EFI_STATUS Status;
-    APPLE_MAILBOX_MESSAGE Message;
 
     if (RtKit == NULL || RtKit->Mailbox == NULL) {
         return EFI_INVALID_PARAMETER;
     }
 
-    // Send a message to wake up a possibly sleeping IOP.
-    PrepareManagementMessage(
-        &Message,
-        RTKIT_MANAGEMENT_MESSAGE_IOP_POWER_STATE,
+    RtKit->IopPowerState = RTKIT_POWER_STATE_SLEEP;
+    RtKit->ApPowerState = RTKIT_POWER_STATE_QUIESCED;
+
+    Status = RTKitSendMessage(RtKit, RTKIT_ENDPOINT_MANAGEMENT,
+        FIELD_PREP(RTKIT_MANAGEMENT_MESSAGE_TYPE, RTKIT_MANAGEMENT_MESSAGE_IOP_POWER_STATE) |
         RTKIT_POWER_STATE_ON);
 
-    Status = AppleMailboxSendMessage(RtKit->Mailbox, &Message);
-
     if (EFI_ERROR(Status)) {
-        DEBUG((DEBUG_ERROR, "AppleRTKitBoot: Failed to send IOP_PWR_STATE message: %r\n", Status));
+        DEBUG((DEBUG_ERROR, "AppleRTKitBoot: Failed to send IOP_POWER_STATE message: %r\n", Status));
         return Status;
     }
 
-    // Wait for a reply, we should receive a HELLO message.
-    Status = AppleMailboxReceiveMessageWithTimeout(RtKit->Mailbox, &Message, 1000000);
-
-    if (EFI_ERROR(Status)) {
-        DEBUG((DEBUG_ERROR, "AppleRTKitBoot: Timed out waiting for a reply from RTKit\n"));
-        return Status;
-    }
-
-    if (Message.Message1 != RTKIT_ENDPOINT_MANAGEMENT) {
-        DEBUG((DEBUG_ERROR, "AppleRTKitBoot: Received message from unexpected endpoint %u\n", Message.Message1));
-        return EFI_DEVICE_ERROR;
-    }
-
-    UINT8 MessageType = FIELD_GET(RTKIT_MANAGEMENT_MESSAGE_TYPE, Message.Message0);
-
-    if (MessageType != RTKIT_MANAGEMENT_MESSAGE_HELLO) {
-        DEBUG((DEBUG_ERROR, "AppleRTKitBoot: Expected HELLO message, got %u\n", MessageType));
-        return EFI_DEVICE_ERROR;
-    }
-
-    // Figure out a common protocol version, we support versions 11 and 12.
-    UINT16 MinVersion = FIELD_GET(RTKIT_HELLO_MIN_VERSION, Message.Message0);
-    UINT16 MaxVersion = FIELD_GET(RTKIT_HELLO_MAX_VERSION, Message.Message0);
-
-    if (MinVersion > RTKIT_MAX_VERSION || MaxVersion < RTKIT_MIN_VERSION) {
-        DEBUG((DEBUG_ERROR, "AppleRTKitBoot: RTKit version incompatible (device supports %u to %u, we support %u to %u)\n",
-            MinVersion, MaxVersion, RTKIT_MIN_VERSION, RTKIT_MAX_VERSION));
-        return EFI_UNSUPPORTED;
-    }
-
-    // Let's pick the highest common version both sides support.
-    UINT32 ProtocolVersion = MIN(MaxVersion, RTKIT_MAX_VERSION);
-
-    DEBUG((DEBUG_INFO, "AppleRTKitBoot: Booting RTKit, version %u\n", ProtocolVersion));
-
-    UINT64 HelloReply = 0;
-
-    HelloReply |= FIELD_PREP(RTKIT_HELLO_MIN_VERSION, ProtocolVersion);
-    HelloReply |= FIELD_PREP(RTKIT_HELLO_MAX_VERSION, ProtocolVersion);
-
-    PrepareManagementMessage(
-        &Message,
-        RTKIT_MANAGEMENT_MESSAGE_HELLO_ACK,
-        HelloReply);
-
-    Status = AppleMailboxSendMessage(RtKit->Mailbox, &Message);
-
-    if (EFI_ERROR(Status)) {
-        DEBUG((DEBUG_ERROR, "AppleRTKitBoot: Failed to send HELLO_REPLY message: %r\n", Status));
-        return Status;
-    }
-
-    // Map needed system endpoints.
-    BOOLEAN HasCrashlogEndpoint = FALSE;
-    BOOLEAN HasDebugEndpoint = FALSE;
-    BOOLEAN HasIoReportEndpoint = FALSE;
-    BOOLEAN HasSyslogEndpoint = FALSE;
-    BOOLEAN HasOsLogEndpoint = FALSE;
-    BOOLEAN HasEpMapDone = FALSE;
-
-    while (!HasEpMapDone) {
-        Status = AppleMailboxReceiveMessageWithTimeout(RtKit->Mailbox, &Message, 1000000);
-
-        if (EFI_ERROR(Status)) {
-            DEBUG((DEBUG_ERROR, "AppleRTKitBoot: Timed out waiting for endpoint map request\n"));
-            return Status;
-        }
-
-        if (Message.Message1 != RTKIT_ENDPOINT_MANAGEMENT) {
-            DEBUG((DEBUG_ERROR, "AppleRTKitBoot: Received message from unexpected endpoint %u\n", Message.Message1));
-            return EFI_DEVICE_ERROR;
-        }
-
-        UINT8 MessageType = FIELD_GET(RTKIT_MANAGEMENT_MESSAGE_TYPE, Message.Message0);
-
-        if (MessageType != RTKIT_MANAGEMENT_MESSAGE_ENDPOINT_MAP) {
-            DEBUG((DEBUG_INFO, "AppleRTKitBoot: Received unexpected message type %u\n", MessageType));
-            return EFI_DEVICE_ERROR;
-        }
-
-        // Extract the base and bitmap from the map request message.
-        UINT32 MapEndpointBase = FIELD_GET(RTKIT_ENDPOINT_MAP_BASE, Message.Message0);
-        UINT32 MapEndpointBitmap = FIELD_GET(RTKIT_ENDPOINT_MAP_BITMAP, Message.Message0);
-
-        for (UINT32 Index = 0; Index < 32; Index++) {
-            if ((MapEndpointBitmap & (1 << Index)) == 0) {
-                continue;
-            }
-
-            UINT8 EndpointNumber = (UINT8)((MapEndpointBase << 5) + Index);
-
-            if (EndpointNumber >= 0x20) {
-                // Skip application endpoints for now.
-                continue;
-            }
-
-            switch (EndpointNumber) {
-                case RTKIT_ENDPOINT_CRASHLOG:
-                    HasCrashlogEndpoint = TRUE;
-                    break;
-                case RTKIT_ENDPOINT_DEBUG:
-                    HasDebugEndpoint = TRUE;
-                    break;
-                case RTKIT_ENDPOINT_IOREPORT:
-                    HasIoReportEndpoint = TRUE;
-                    break;
-                case RTKIT_ENDPOINT_SYSLOG:
-                    HasSyslogEndpoint = TRUE;
-                    break;
-                case RTKIT_ENDPOINT_OSLOG:
-                    HasOsLogEndpoint = TRUE;
-                    break;
-                case RTKIT_ENDPOINT_MANAGEMENT:
-                    // Ignore management endpoint, it's started by default.
-                    break;
-                default:
-                    DEBUG((DEBUG_INFO, "AppleRTKitBoot: Unhandled RTKit endpoint %u\n", EndpointNumber));
-                    break;
-            }
-        }
-
-        if ((Message.Message0 & BIT51) != 0) {
-            // This is the last endpoint map message.
-            HasEpMapDone = TRUE;
-        }
-
-        UINT64 MapEndpointReply = 0;
-
-        MapEndpointReply |= FIELD_PREP(RTKIT_ENDPOINT_MAP_BASE, MapEndpointBase);
-
-        if (HasEpMapDone) {
-            MapEndpointReply |= RTKIT_ENDPOINT_MAP_DONE;
-        } else {
-            MapEndpointReply |= RTKIT_ENDPOINT_MAP_MORE;
-        }
-
-        // Send an acknowledgment.
-        PrepareManagementMessage(
-            &Message,
-            RTKIT_MANAGEMENT_MESSAGE_ENDPOINT_MAP_ACK,
-            MapEndpointReply);
-
-        Status = AppleMailboxSendMessage(RtKit->Mailbox, &Message);
-
-        if (EFI_ERROR(Status)) {
-            DEBUG((DEBUG_ERROR, "AppleRTKitBoot: Failed to send EPMAP_REPLY message: %r\n", Status));
-            return Status;
-        }
-    }
-
-    if (HasDebugEndpoint) {
-        Status = AppleRTKitStartEndpoint(RtKit, RTKIT_ENDPOINT_DEBUG);
-
-        if (EFI_ERROR(Status)) {
-            DEBUG((DEBUG_ERROR, "AppleRTKitBoot: Failed to start debug endpoint: %r\n", Status));
-            return Status;
-        }
-    }
-
-    if (HasCrashlogEndpoint) {
-        Status = AppleRTKitStartEndpoint(RtKit, RTKIT_ENDPOINT_CRASHLOG);
-
-        if (EFI_ERROR(Status)) {
-            DEBUG((DEBUG_ERROR, "AppleRTKitBoot: Failed to start crashlog endpoint: %r\n", Status));
-            return Status;
-        }
-    }
-
-    if (HasSyslogEndpoint) {
-        Status = AppleRTKitStartEndpoint(RtKit, RTKIT_ENDPOINT_SYSLOG);
-
-        if (EFI_ERROR(Status)) {
-            DEBUG((DEBUG_ERROR, "AppleRTKitBoot: Failed to start syslog endpoint: %r\n", Status));
-            return Status;
-        }
-    }
-
-    if (HasIoReportEndpoint) {
-        Status = AppleRTKitStartEndpoint(RtKit, RTKIT_ENDPOINT_IOREPORT);
-
-        if (EFI_ERROR(Status)) {
-            DEBUG((DEBUG_ERROR, "AppleRTKitBoot: Failed to start ioreport endpoint: %r\n", Status));
-            return Status;
-        }
-    }
-
-    if (HasOsLogEndpoint) {
-        Status = AppleRTKitStartEndpoint(RtKit, RTKIT_ENDPOINT_OSLOG);
-
-        if (EFI_ERROR(Status)) {
-            DEBUG((DEBUG_ERROR, "AppleRTKitBoot: Failed to start oslog endpoint: %r\n", Status));
-            return Status;
-        }
-    }
-
+    // Wait for the RTKit to transition to the power on state.
     while (RtKit->IopPowerState != RTKIT_POWER_STATE_ON) {
         APPLE_RTKIT_MESSAGE RtKitMessage;
 
@@ -429,21 +396,17 @@ AppleRTKitBoot(
         if (Status == EFI_SUCCESS) {
             DEBUG((DEBUG_INFO, "AppleRTKitBoot: Received unexpected message on endpoint %u during power on wait\n", RtKitMessage.Endpoint));
             return EFI_DEVICE_ERROR;
-        } else if (Status != EFI_NOT_READY) {
+        } else if (Status != EFI_TIMEOUT) {
             DEBUG((DEBUG_ERROR, "AppleRTKitBoot: Failed to receive power state message: %r\n", Status));
             return Status;
         } else {
-            DEBUG((DEBUG_INFO, "AppleRTKitBoot: Waiting for IOP to power on...\n"));
-            MicroSecondDelay(10000);
+            MicroSecondDelay(100000);
         }
     }
 
-    PrepareManagementMessage(
-        &Message,
-        RTKIT_MANAGEMENT_MESSAGE_AP_POWER_STATE,
-        RTKIT_POWER_STATE_ON);
-
-    Status = AppleMailboxSendMessage(RtKit->Mailbox, &Message);
+    Status = RTKitSendMessage(RtKit, RTKIT_ENDPOINT_MANAGEMENT,
+         FIELD_PREP(RTKIT_MANAGEMENT_MESSAGE_TYPE, RTKIT_MANAGEMENT_MESSAGE_AP_POWER_STATE) |
+         RTKIT_POWER_STATE_ON);
 
     if (EFI_ERROR(Status)) {
         DEBUG((DEBUG_ERROR, "AppleRTKitBoot: Failed to send AP_PWR_STATE message: %r\n", Status));
@@ -462,7 +425,6 @@ AppleRTKitReceiveMessage(
     OUT APPLE_RTKIT_MESSAGE *Message
 ) {
     EFI_STATUS Status;
-    APPLE_MAILBOX_MESSAGE MailboxMessage;
 
     if (RtKit == NULL || RtKit->Mailbox == NULL || Message == NULL) {
         return EFI_INVALID_PARAMETER;
@@ -471,104 +433,55 @@ AppleRTKitReceiveMessage(
     ASSERT(!RtKit->Crashed);
 
     while (TRUE) {
-        // Receive a message from the mailbox.
-        Status = AppleMailboxReceiveMessage(RtKit->Mailbox, &MailboxMessage);
+        Status = RTKitReceiveMessage(RtKit, Message, 100000);
 
         if (EFI_ERROR(Status)) {
             return Status;
         }
 
         // Reject messages from invalid endpoints.
-        if (MailboxMessage.Message1 >= 0x100) {
-            DEBUG((DEBUG_ERROR, "AppleRTKitReceiveMessage: Received message from invalid endpoint %llu\n", MailboxMessage.Message1));
+        if (Message->Endpoint >= 0x100) {
+            DEBUG((DEBUG_ERROR, "AppleRTKitReceiveMessage: Received message from invalid endpoint %llu\n", Message->Endpoint));
             continue;
         }
-
-        // Populate the output structure.
-        Message->Message = MailboxMessage.Message0;
-        Message->Endpoint = (UINT8)MailboxMessage.Message1;
 
         // If the endpoint is an application endpoint, return to the caller.
         if (Message->Endpoint >= 0x20) {
             return EFI_SUCCESS;
         }
 
-        // Extract the message type from the message.
-        UINT8 MessageType = (UINT8)(Message->Message >> 52);
+        DEBUG((DEBUG_INFO, "AppleRTKitReceiveMessage: Received message from system endpoint %u: 0x%016llx\n", Message->Endpoint, Message->Message));
 
-        DEBUG((DEBUG_INFO, "AppleRTKitReceiveMessage: Received message from system endpoint %u, type %u\n", Message->Endpoint, MessageType));
-        DEBUG((DEBUG_INFO, "AppleRTKitReceiveMessage: Message payload: 0x%016lx\n", Message->Message));
+        if (Message->Endpoint == RTKIT_ENDPOINT_MANAGEMENT) {
+            Status = HandleManagementMessage(RtKit, Message);
+        } else if (Message->Endpoint == RTKIT_ENDPOINT_SYSLOG) {
+            Status = HandleSyslogMessage(RtKit, Message);
+        } else if (Message->Endpoint == RTKIT_ENDPOINT_CRASHLOG) {
+            Status = HandleCrashlogMessage(RtKit, Message);
+        } else if (Message->Endpoint == RTKIT_ENDPOINT_IOREPORT) {
+            UINT8 MessageType = FIELD_GET(RTKIT_MANAGEMENT_MESSAGE_TYPE, Message->Message);
 
-        switch (Message->Endpoint) {
-            case RTKIT_ENDPOINT_MANAGEMENT: {
-                switch (MessageType) {
-                    case RTKIT_MANAGEMENT_MESSAGE_IOP_POWER_STATE_ACK:
-                        RtKit->IopPowerState = (UINT32)(Message->Message & 0xFFFF);
-                        break;
-                    case RTKIT_MANAGEMENT_MESSAGE_AP_POWER_STATE_ACK:
-                        RtKit->ApPowerState = (UINT32)(Message->Message & 0xFFFF);
-                        break;
-                    default:
-                        DEBUG((DEBUG_ERROR, "AppleRTKitReceiveMessage: Received unknown management message type %u\n", MessageType));
-                        break;
-                }
-                break;
+            if (MessageType == RTKIT_BUFFER_REQUEST) {
+                Status = HandleBufferRequest(RtKit, Message, &RtKit->IoreportBuffer);
+            } else if (MessageType == 8 || MessageType == 12) {
+                // Unknown messages but they must be acked to avoid issues.
+                Status = RTKitSendMessage(RtKit, RTKIT_ENDPOINT_IOREPORT, Message->Message);
+            } else {
+                DEBUG((DEBUG_ERROR, "AppleRTKitReceiveMessage: Received unknown ioreport message type %u\n", MessageType));
+                Status = EFI_UNSUPPORTED;
             }
-            case RTKIT_ENDPOINT_SYSLOG: {
-                switch (MessageType) {
-                    case 1:
-                        // Buffer request
-                        Status = HandleBufferRequest(RtKit, Message, &RtKit->SyslogBuffer);
-                        break;
-                    case 5:
-                        // System log message, unhandled for now but must be acked to avoid issues.
-                        Status = AppleMailboxSendMessage(RtKit->Mailbox, &MailboxMessage);
-                        break;
-                    default:
-                        DEBUG((DEBUG_INFO, "AppleRTKitReceiveMessage: Received unknown syslog message type %u\n", MessageType));
-                        break;
-                }
-                break;
+        } else if (Message->Endpoint == RTKIT_ENDPOINT_OSLOG) {
+            UINT8 MessageType = FIELD_GET(RTKIT_OSLOG_MESSAGE_TYPE, Message->Message);
+
+            if (MessageType == RTKIT_BUFFER_REQUEST) {
+                Status = HandleBufferRequest(RtKit, Message, &RtKit->SyslogBuffer);
+            } else {
+                DEBUG((DEBUG_ERROR, "AppleRTKitReceiveMessage: Received unknown oslog message type %u\n", MessageType));
+                Status = EFI_UNSUPPORTED;
             }
-            case RTKIT_ENDPOINT_CRASHLOG: {
-                switch (MessageType) {
-                    case 1:
-                        // Buffer request
-                        if (RtKit->CrashlogBuffer.DeviceAddress != 0) {
-                            ASSERT(FALSE && "RTKit crash!!!");
-                        }
-                        Status = HandleBufferRequest(RtKit, Message, &RtKit->CrashlogBuffer);
-                        break;
-                    default:
-                        DEBUG((DEBUG_INFO, "AppleRTKitReceiveMessage: Received unknown crashlog message type %u\n", MessageType));
-                        break;
-                }
-                break;
-            }
-            case RTKIT_ENDPOINT_IOREPORT: {
-                switch (MessageType) {
-                    case 1:
-                        // Buffer request
-                        Status = HandleBufferRequest(RtKit, Message, &RtKit->IoreportBuffer);
-                        break;
-                    case 8:
-                    case 12:
-                        // Unknown messages but they must be acked to avoid issues.
-                        Status = AppleMailboxSendMessage(RtKit->Mailbox, &MailboxMessage);
-                        break;
-                    default:
-                        DEBUG((DEBUG_INFO, "AppleRTKitReceiveMessage: Received unknown ioreport message type %u\n", MessageType));
-                        break;
-                }
-                break;
-            }
-            case RTKIT_ENDPOINT_OSLOG: {
-                DEBUG((DEBUG_INFO, "AppleRTKitReceiveMessage: Received unknown oslog message type %u\n", MessageType));
-                break;
-            }
-            default:
-                DEBUG((DEBUG_ERROR, "AppleRTKitReceiveMessage: Received message from unknown system endpoint %u\n", Message->Endpoint));
-                continue;
+        } else {
+            DEBUG((DEBUG_ERROR, "AppleRTKitReceiveMessage: Received message from unknown system endpoint %u\n", Message->Endpoint));
+            continue;
         }
 
         if (EFI_ERROR(Status)) {
@@ -578,7 +491,7 @@ AppleRTKitReceiveMessage(
     }
 
     // No message from application endpoint was received.
-    return EFI_NOT_READY;
+    return EFI_TIMEOUT;
 }
 
 EFI_STATUS
@@ -586,16 +499,8 @@ AppleRTKitStartEndpoint(
     IN APPLE_RTKIT *RtKit,
     IN UINT8 Endpoint
 ) {
-    APPLE_MAILBOX_MESSAGE Message;
-    UINT64 Payload = 0;
-
-    Payload |= FIELD_PREP(RTKIT_START_ENDPOINT_INDEX, (UINT64)Endpoint);
-    Payload |= RTKIT_START_ENDPOINT_FLAG;
-
-    PrepareManagementMessage(
-        &Message,
-        RTKIT_MANAGEMENT_MESSAGE_START_ENDPOINT,
-        Payload);
-
-    return AppleMailboxSendMessage(RtKit->Mailbox, &Message);
+    return RTKitSendMessage(RtKit, RTKIT_ENDPOINT_MANAGEMENT,
+        FIELD_PREP(RTKIT_MANAGEMENT_MESSAGE_TYPE, RTKIT_MANAGEMENT_MESSAGE_START_ENDPOINT) |
+        FIELD_PREP(RTKIT_START_ENDPOINT_INDEX, Endpoint) |
+        RTKIT_START_ENDPOINT_FLAG);
 }
